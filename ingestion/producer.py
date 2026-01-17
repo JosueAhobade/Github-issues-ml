@@ -1,303 +1,270 @@
 import os
-import time
 import json
-import requests
+import time
+from datetime import datetime, timezone
 from kafka import KafkaProducer
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# =====================
+# ENV
+# =====================
 load_dotenv()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-KAFKA_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC")
 KAFKA_API_KEY = os.getenv("KAFKA_API_KEY")
 KAFKA_API_SECRET = os.getenv("KAFKA_API_SECRET")
 
-# Kafka producer
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_SERVERS,
-    security_protocol="SASL_SSL",
-    sasl_mechanism="PLAIN",
-    sasl_plain_username=KAFKA_API_KEY,
-    sasl_plain_password=KAFKA_API_SECRET,
-    value_serializer=lambda v: json.dumps(v).encode("utf-8")
-)
+GRAPHQL_URL = "https://api.github.com/graphql"
 
 HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github.v4+json"
 }
 
-GRAPHQL_URL = "https://api.github.com/graphql"
+# =====================
+# KAFKA PRODUCER
+# =====================
+producer = KafkaProducer(
+    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+    security_protocol="SASL_SSL",
+    sasl_mechanism="PLAIN",
+    sasl_plain_username=KAFKA_API_KEY,
+    sasl_plain_password=KAFKA_API_SECRET,
+    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    linger_ms=10
+)
 
-# -----------------------------
-# 1️⃣ Users
-# -----------------------------
-def fetch_users(after_cursor=None, first=100):
+# =====================
+# SESSION REQUESTS AVEC RETRY
+# =====================
+session = requests.Session()
+retry_strategy = Retry(
+    total=5,  # retries
+    backoff_factor=2,  # pause exponentielle
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["POST"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+
+def is_abandoned(issue, days_threshold=90):
+    """
+    Retourne True si l'issue est considérée comme abandonnée.
+    """
+    if issue["state"] == "CLOSED":
+        return False  # une issue fermée n'est pas abandonnée
+
+    last_update = datetime.fromisoformat(issue["updatedAt"].replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    return (now - last_update).days > days_threshold
+
+def compute_time_to_close(issue):
+    """
+    Retourne le temps de fermeture en jours pour une issue fermée.
+    """
+    if issue["state"] != "CLOSED" or not issue["closedAt"]:
+        return None  # impossible de calculer pour une issue ouverte
+
+    created = datetime.fromisoformat(issue["createdAt"].replace("Z", "+00:00"))
+    closed = datetime.fromisoformat(issue["closedAt"].replace("Z", "+00:00"))
+    delta = closed - created
+    return delta.total_seconds() / 86400  # convertir en jours
+
+
+def graphql(query, variables=None):
+    try:
+        r = session.post(
+            GRAPHQL_URL,
+            headers=HEADERS,
+            json={"query": query, "variables": variables or {}},
+            timeout=15  # timeout 15s
+        )
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Erreur API GitHub: {e}")
+        return None
+
+# =====================
+# FETCH USERS
+# =====================
+def fetch_users(after=None, first=50):
     query = """
-    query ($first:Int, $after:String) {
-      search(query: "type:user repos:>5 followers:>10", type: USER, first:$first, after:$after) {
-        userCount
+    query ($first:Int!, $after:String) {
+      search(query: "type:user repos:>10 followers:>50", type: USER, first:$first, after:$after) {
         pageInfo { hasNextPage endCursor }
-        nodes { ... on User { login id } }
+        nodes { ... on User { login } }
       }
     }
     """
-    variables = {"first": first, "after": after_cursor}
-    resp = requests.post(GRAPHQL_URL, headers=HEADERS, json={"query": query, "variables": variables})
-    if resp.status_code == 200:
-        return resp.json()["data"]["search"]
-    else:
-        print("Erreur fetch_users:", resp.text)
+    data = graphql(query, {"first": first, "after": after})
+    if not data or "data" not in data:
         return None
+    return data["data"]["search"]
 
-# -----------------------------
-# 2️⃣ Repos
-# -----------------------------
-def fetch_repos(user_login, after_cursor=None, first=10):
+# =====================
+# FETCH REPOS
+# =====================
+def fetch_repos(user, after=None, first=10):
     query = """
-    query($login:String!, $first:Int, $after:String) {
-      user(login: $login) {
-        repositories(first: $first, after: $after, orderBy:{field:UPDATED_AT, direction:DESC}) {
+    query ($login:String!, $first:Int!, $after:String) {
+      user(login:$login) {
+        repositories(first:$first, after:$after, orderBy:{field:STARGAZERS, direction:DESC}) {
           pageInfo { hasNextPage endCursor }
-          nodes { name stargazerCount updatedAt }
+          nodes {
+            name
+            stargazerCount
+            forkCount
+            createdAt
+            primaryLanguage { name }
+          }
         }
       }
     }
     """
-    variables = {"login": user_login, "first": first, "after": after_cursor}
-    resp = requests.post(GRAPHQL_URL, headers=HEADERS, json={"query": query, "variables": variables})
-    if resp.status_code == 200:
-        return resp.json()["data"]["user"]["repositories"]
-    else:
-        print("Erreur fetch_repos:", resp.text)
+    data = graphql(query, {"login": user, "first": first, "after": after})
+    if not data or "data" not in data or "user" not in data["data"]:
         return None
+    return data["data"]["user"]["repositories"]
 
-# -----------------------------
-# 3️⃣ Issues
-# -----------------------------
-def fetch_issues(user, repo, after_cursor=None, first=20):
+# =====================
+# FETCH ISSUES
+# =====================
+def fetch_issues(owner, repo, after=None, first=20):
     query = """
-    query($owner: String!, $name: String!, $after: String, $first: Int!) {
-      repository(owner: $owner, name: $name) {
-        issues(first: $first, after: $after, states: [OPEN, CLOSED]) {
-          edges {
-            cursor
-            node {
-              id
-              number
-              title
-              body
-              labels(first:10){ nodes { name } }
-              state
-              createdAt
-              updatedAt
-            }
-          }
-          pageInfo {
-            hasNextPage
-            endCursor
+    query ($owner:String!, $name:String!, $first:Int!, $after:String) {
+      repository(owner:$owner, name:$name) {
+        issues(first:$first, after:$after, states:[OPEN, CLOSED]) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            databaseId
+            number
+            title
+            body
+            state
+            createdAt
+            closedAt
+            comments { totalCount }
+            labels(first:10) { nodes { name } }
           }
         }
       }
     }
     """
-    variables = {"owner": user, "name": repo, "after": after_cursor, "first": first}
-    resp = requests.post(
-        "https://api.github.com/graphql",
-        headers={"Authorization": f"bearer {GITHUB_TOKEN}"},
-        json={"query": query, "variables": variables}
-    )
+    data = graphql(query, {
+        "owner": owner,
+        "name": repo,
+        "first": first,
+        "after": after
+    })
+    if not data or "data" not in data or not data["data"]["repository"]:
+        return None
+    return data["data"]["repository"]["issues"]
 
-    json_data = resp.json()
-    
-    # ⚠️ Gérer si repository est None
-    if json_data.get("data") is None or json_data["data"].get("repository") is None:
-        print(f"⚠️ Repository {user}/{repo} introuvable ou accès refusé")
-        if "errors" in json_data:
-            print("Erreurs:", json_data["errors"])
-        return {"edges": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
-
-    return json_data["data"]["repository"]["issues"]
-
-# -----------------------------
-# Producer principal
-# -----------------------------
-def produce_graphql():
+# =====================
+# PRODUCER PRINCIPAL
+# =====================
+# =====================
+# PRODUCER PRINCIPAL
+# =====================
+def run():
     user_cursor = None
+
     while True:
-        search_users = fetch_users(after_cursor=user_cursor, first=50)
-        if not search_users:
+        users = fetch_users(after=user_cursor)
+        if not users:
+            print("⚠️ Problème fetch_users, pause 60s...")
             time.sleep(60)
             continue
 
-        for user in search_users["nodes"]:
+        for user in users["nodes"]:
             login = user["login"]
-            print(f"➡️ Collecte repos pour user: {login}")
+            print(f"👤 User: {login}")
 
             repo_cursor = None
             while True:
-                repos = fetch_repos(login, after_cursor=repo_cursor, first=10)
-                if not repos or "nodes" not in repos:
+                repos = fetch_repos(login, after=repo_cursor)
+                if not repos:
                     break
 
                 for repo in repos["nodes"]:
                     repo_name = repo["name"]
-                    print(f"    📦 Repos: {repo_name}")
+                    print(f"  📦 Repo: {repo_name}")
 
-                    # -----------------------------
-                    # Issues
-                    # -----------------------------
                     issue_cursor = None
                     while True:
-                        issues = fetch_issues(login, repo_name, after_cursor=issue_cursor, first=20)
-                        if not issues or "edges" not in issues:
+                        issues = fetch_issues(login, repo_name, after=issue_cursor)
+                        if not issues:
                             break
 
-                        for edge in issues["edges"]:
-                            issue = edge["node"]
-                            data = {
-                                "id": issue["id"],
-                                "number": issue["number"],
-                                "title": issue["title"],
-                                "body": issue.get("body", ""),
-                                "labels": [label["name"] for label in issue.get("labels", {}).get("nodes", [])],
+                        for issue in issues["nodes"]:
+                            if issue["databaseId"] is None:
+                                continue
+
+                            labels = [l["name"].lower() for l in issue["labels"]["nodes"]]
+
+                            # ✅ calcul des nouvelles features
+                            time_to_close = compute_time_to_close(issue)
+                            abandoned = is_abandoned(issue)
+
+                            message = {
+                                "issue_id": issue["databaseId"],
+                                "repo": f"{login}/{repo_name}",
+                                "language": repo["primaryLanguage"]["name"] if repo["primaryLanguage"] else "unknown",
+                                "stars": repo["stargazerCount"],
+                                "forks": repo["forkCount"],
+                                "issue_number": issue["number"],
+                                "title_text": issue["title"] or "",   # <- nouveau champ
+                                "body_text": issue["body"] or "",
+                                "title_length": len(issue["title"] or ""),
+                                "body_length": len(issue["body"] or ""),
+                                "num_labels": len(labels),
+                                "has_bug_label": int(any("bug" in l for l in labels)),
+                                "contains_bug": int("bug" in ((issue["title"] or "") + (issue["body"] or "")).lower()),
+                                "num_comments": issue["comments"]["totalCount"],
                                 "state": issue["state"],
                                 "created_at": issue["createdAt"],
-                                "updated_at": issue["updatedAt"],
-                                "repo": f"{login}/{repo_name}",
-                                "ingested_at": datetime.now(timezone.utc).isoformat()
+                                "closed_at": issue["closedAt"],
+                                "ingested_at": datetime.now(timezone.utc).isoformat(),
+                                "repo_age_days": (datetime.fromisoformat(issue["createdAt"].replace("Z","")) - datetime.fromisoformat(repo["createdAt"].replace("Z",""))).days,
+                                "created_weekday": datetime.fromisoformat(issue["createdAt"].replace("Z","")).weekday(),
+                                "created_hour": datetime.fromisoformat(issue["createdAt"].replace("Z","")).hour,
+                                "time_to_close": time_to_close,
+                                "is_abandoned": int(abandoned),
+                                "processed_for_model": 0,   # <- nouveau champ pour ML
+                                "dataset_split": "none"     # <- nouveau champ pour train/val/test
                             }
-                            producer.send(KAFKA_TOPIC, key=str(issue["id"]).encode("utf-8"), value=data)
-                            print(f"        ✅ Issue envoyée: {data['title'][:30]}...")
 
-                        # Pagination des issues
+                            producer.send(
+                                KAFKA_TOPIC,
+                                key=str(issue["databaseId"]).encode(),
+                                value=message
+                            )
+
+                            # Pause pour éviter throttling
+                            time.sleep(0.3)
+
                         if not issues["pageInfo"]["hasNextPage"]:
                             break
                         issue_cursor = issues["pageInfo"]["endCursor"]
 
-                # Pagination des repos
                 if not repos["pageInfo"]["hasNextPage"]:
                     break
                 repo_cursor = repos["pageInfo"]["endCursor"]
 
-        # Pagination des users
-        if not search_users["pageInfo"]["hasNextPage"]:
+        if not users["pageInfo"]["hasNextPage"]:
             break
-        user_cursor = search_users["pageInfo"]["endCursor"]
+        user_cursor = users["pageInfo"]["endCursor"]
 
-    user_cursor = None
-    while True:  # boucle continue
-        search_users = fetch_users(after_cursor=user_cursor, first=50)
-        if not search_users:
-            time.sleep(60)
-            continue
-        
-        for user in search_users["nodes"]:
-            login = user["login"]
-            print(f"➡️ Collecte repos pour user: {login}")
-            
-            repo_cursor = None
-            while True:
-                repos = fetch_repos(login, after_cursor=repo_cursor, first=10)
-                if not repos or "nodes" not in repos:
-                    break
+        time.sleep(2)
 
-                for repo in repos["nodes"]:
-                    repo_name = repo["name"]
-                    print(f"    📦 Repos: {repo_name}")
-
-                    issue_cursor = None
-                    while True:
-                        issues = fetch_issues(login, repo_name, after_cursor=issue_cursor, first=20)
-                        if not issues or "edges" not in issues:
-                            break
-
-                        for edge in issues["edges"]:
-                            issue = edge["node"]
-                            data = {
-                                "id": issue["id"],
-                                "number": issue["number"],
-                                "title": issue["title"],
-                                "body": issue.get("body", ""),
-                                "labels": [label["name"] for label in issue.get("labels", {}).get("nodes", [])],
-                                "state": issue["state"],
-                                "created_at": issue["createdAt"],
-                                "updated_at": issue["updatedAt"],
-                                "repo": f"{login}/{repo_name}",
-                                "ingested_at": datetime.now(timezone.utc).isoformat()
-                            }
-                            producer.send(KAFKA_TOPIC, key=str(issue["id"]).encode("utf-8"), value=data)
-                            print(f"        ✅ Issue envoyée: {data['title'][:30]}...")
-
-                        # pagination
-                        if not issues["pageInfo"]["hasNextPage"]:
-                            break
-                        issue_cursor = issues["pageInfo"]["endCursor"]
-
-                if not repos["pageInfo"]["hasNextPage"]:
-                    break
-                repo_cursor = repos["pageInfo"]["endCursor"]
-
-                login = user["login"]
-                print(f"➡️ Collecte repos pour user: {login}")
-                repo_cursor = None
-                while True:
-                    repos = fetch_repos(login, after_cursor=repo_cursor, first=10)
-                    if not repos:
-                        break
-                    if not issues or "edges" not in issues:
-                        break
-                    for edge in issues["edges"]:
-                        issue = edge["node"]  # c’est ici que se trouve l’issue
-                        data = {
-                            "id": issue["id"],
-                            "number": issue["number"],
-                            "title": issue["title"],
-                            "body": issue.get("body", ""),
-                            "labels": [label["name"] for label in issue.get("labels", {}).get("nodes", [])],
-                            "state": issue["state"],
-                            "created_at": issue["createdAt"],
-                            "updated_at": issue["updatedAt"],
-                            "repo": f"{login}/{repo_name}",
-                            "ingested_at": datetime.now(timezone.utc).isoformat()
-                        }
-                        producer.send(KAFKA_TOPIC, key=str(issue["id"]).encode("utf-8"), value=data)
-                        print(f"        ✅ Issue envoyée: {data['title'][:30]}...")
-
-                        repo_name = repo["name"]
-                        print(f"    📦 Repos: {repo_name}")
-                        # issues
-                        issue_cursor = None
-                        while True:
-                            issues = fetch_issues(login, repo_name, after_cursor=issue_cursor, first=20)
-                            if not issues:
-                                break
-                            for issue in issues["nodes"]:
-                                data = {
-                                    "id": issue["id"],
-                                    "number": issue["number"],
-                                    "title": issue["title"],
-                                    "body": issue.get("body", ""),
-                                    "labels": [label["name"] for label in issue.get("labels", {}).get("nodes", [])],
-                                    "state": issue["state"],
-                                    "created_at": issue["createdAt"],
-                                    "updated_at": issue["updatedAt"],
-                                    "repo": f"{login}/{repo_name}",
-                                    "ingested_at": datetime.now(timezone.utc).isoformat()
-                                }
-                                producer.send(KAFKA_TOPIC, key=str(issue["id"]).encode("utf-8"), value=data)
-                                print(f"        ✅ Issue envoyée: {data['title'][:30]}...")
-                            if not issues["pageInfo"]["hasNextPage"]:
-                                break
-                            issue_cursor = issues["pageInfo"]["endCursor"]
-                    if not repos["pageInfo"]["hasNextPage"]:
-                        break
-                    repo_cursor = repos["pageInfo"]["endCursor"]
-                if not search_users["pageInfo"]["hasNextPage"]:
-                    break
-                user_cursor = search_users["pageInfo"]["endCursor"]
-
+# =====================
+# MAIN
+# =====================
 if __name__ == "__main__":
-    produce_graphql()
+    run()
