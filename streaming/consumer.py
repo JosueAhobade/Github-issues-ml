@@ -84,28 +84,27 @@ def safe_insert(issue):
                     issue["stars"],
                     issue["forks"],
                     issue["issue_number"],
-                    issue["title"] or "",                # title_text
-                    issue["body"] or "",                 # body_text
-                    len(issue["title"] or ""),           # title_length
-                    len(issue["body"] or ""),            # body_length
+                    issue["title_text"],
+                    issue["body_text"],
+                    issue["title_length"],
+                    issue["body_length"],
                     issue["num_labels"],
                     issue["has_bug_label"],
-                    int("bug" in ((issue["title"] or "") + (issue["body"] or "")).lower()),  # contains_bug
+                    issue["contains_bug"],
                     issue["num_comments"],
                     issue["state"],
                     issue["created_at"].replace("T", " ").replace("Z", ""),
                     issue["closed_at"].replace("T", " ").replace("Z", "") if issue["closed_at"] else None,
                     issue["ingested_at"].replace("T", " ").replace("Z", ""),
-                    issue.get("repo_age_days", 0),
-                    issue.get("created_weekday", 0),
-                    issue.get("created_hour", 0),
-                    issue.get("time_to_close"),
-                    issue.get("is_abandoned", 0),
-                    0,             # processed_for_model
-                    'none'         # dataset_split
+                    issue["repo_age_days"],
+                    issue["created_weekday"],
+                    issue["created_hour"],
+                    issue["time_to_close"],
+                    issue["is_abandoned"],
+                    issue["processed_for_model"],
+                    issue["dataset_split"]
                 )
             )
-            db.commit()
             break
 
         except OperationalError as e:

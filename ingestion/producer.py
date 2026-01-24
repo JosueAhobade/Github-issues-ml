@@ -149,6 +149,7 @@ def fetch_issues(owner, repo, after=None, first=20):
             state
             createdAt
             closedAt
+            updatedAt
             comments { totalCount }
             labels(first:10) { nodes { name } }
           }
